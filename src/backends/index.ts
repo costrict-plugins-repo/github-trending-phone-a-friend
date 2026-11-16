@@ -1,0 +1,421 @@
+/**
+ * Backend interface and registry for relay targets.
+ *
+ * Ported from phone_a_friend/backends/__init__.py
+ */
+
+import { execFileSync, spawn as nodeSpawn } from 'node:child_process';
+import { ownProcessGroup, superviseChild } from './child-supervisor.js';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+
+export const REVIEW_SCOPES = ['branch', 'working-tree', 'all'] as const;
+export type ReviewScope = typeof REVIEW_SCOPES[number];
+
+export function isReviewScope(value: unknown): value is ReviewScope {
+  return typeof value === 'string' && REVIEW_SCOPES.includes(value as ReviewScope);
+}
+
+/** How a Claude relay participates in Claude Code cross-session messaging. */
+export type ClaudePeerMessagingMode = 'native' | 'accept' | 'refuse';
+
+export const CLAUDE_PEER_MESSAGING_MODES: readonly ClaudePeerMessagingMode[] = [
+  'native',
+  'accept',
+  'refuse',
+];
+
+export type ResumeStrategy = 'native-session' | 'transcript-replay' | 'unsupported';
+
+export interface BackendCapabilities {
+  /** How this backend handles session resumption. */
+  resumeStrategy: ResumeStrategy;
+  /** Whether the caller must generate a session ID before the first call (e.g. Claude's --session-id). */
+  requiresClientSessionId: boolean;
+}
+
+export interface BackendResult {
+  output: string;
+  exitCode: number;
+}
+
+export interface SessionHistoryEntry {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+/**
+ * Progress reported by a backend while a run is in flight. Only evidence the
+ * backend itself emits is surfaced; PaF never synthesizes activity.
+ */
+export interface BackendEvent {
+  type:
+    | 'session_linked'
+    | 'turn_started'
+    | 'activity'
+    | 'message'
+    | 'turn_completed'
+    | 'turn_failed'
+    | 'error';
+  message: string;
+  data?: Record<string, unknown>;
+}
+
+export interface BackendRunOptions {
+  prompt: string;
+  repoPath: string;
+  timeoutSeconds: number;
+  sandbox: SandboxMode;
+  model: string | null;
+  env: Record<string, string>;
+  schema?: string | null;
+  sessionId?: string | null;
+  persistSession?: boolean;
+  resumeSession?: boolean;
+  fast?: boolean;
+  /** Claude-only cross-session messaging policy. Ignored by other backends. */
+  peerMessaging?: ClaudePeerMessagingMode;
+  /** Human-readable PaF label used to name a peer-visible backend session. */
+  sessionLabel?: string | null;
+  sessionHistory?: SessionHistoryEntry[];
+  onSessionCreated?: (sessionId: string) => void;
+  /** Receives backend progress events as they arrive. Optional; absent means no progress stream is requested. */
+  onEvent?: (event: BackendEvent) => void;
+}
+
+export interface ReviewOptions {
+  repoPath: string;
+  timeoutSeconds: number;
+  sandbox: SandboxMode;
+  model: string | null;
+  env: Record<string, string>;
+  base: string;
+  scope?: ReviewScope;
+  prompt?: string;
+  /** Receives backend progress events as they arrive. Optional. */
+  onEvent?: (event: BackendEvent) => void;
+}
+
+/** Where a relay prompt is headed, for backends that adjust it. */
+export interface PreparePromptContext {
+  mode: 'relay' | 'review';
+}
+
+export interface Backend {
+  name: string;
+  localFileAccess: boolean;
+  allowedSandboxes: ReadonlySet<SandboxMode>;
+  capabilities: BackendCapabilities;
+  /** Review scopes handled by the backend's native review() implementation. Defaults to branch only. */
+  nativeReviewScopes?: ReadonlySet<ReviewScope>;
+  /**
+   * Optional last-step rewrite of the fully built relay prompt, applied by
+   * the relay core on every path (relay, session, stream, generic review)
+   * before the size limit. Backends without it receive the prompt untouched.
+   */
+  preparePrompt?(prompt: string, ctx: PreparePromptContext): string;
+  run(opts: BackendRunOptions): Promise<string>;
+  review?(opts: ReviewOptions): Promise<string>;
+  runStream?(opts: BackendRunOptions): AsyncIterable<string>;
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+export class BackendError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'BackendError';
+  }
+}
+
+/**
+ * Thrown by a backend's `review()` when its native review command could not be
+ * used at all: the CLI refused the invocation before doing any work (an older
+ * CLI without the subcommand or one of its flags).
+ *
+ * It is the only failure `reviewRelay` answers by running the generic path.
+ * Every other failure (time limit, Ctrl-C, sign-in, rate limit, a model error)
+ * means the backend already ran or was told to stop, so a second run would
+ * repeat the work, restart the time limit and hide the first error.
+ */
+export class NativeReviewUnavailableError extends BackendError {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NativeReviewUnavailableError';
+  }
+}
+
+export class SpawnCliError extends BackendError {
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+
+  constructor(
+    message: string,
+    stdout: string,
+    stderr: string,
+    exitCode: number | null,
+  ) {
+    super(message);
+    this.name = 'SpawnCliError';
+    this.stdout = stdout;
+    this.stderr = stderr;
+    this.exitCode = exitCode;
+  }
+}
+
+export class SpawnCliTimeoutError extends BackendError {
+  readonly timeoutMs: number;
+
+  constructor(message: string, timeoutMs: number) {
+    super(message);
+    this.name = 'SpawnCliTimeoutError';
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Install hints
+// ---------------------------------------------------------------------------
+
+/** The lines buildPrompt() writes above what PaF attaches. They stay in replayed session history too. */
+export const GIT_DIFF_HEADING = 'Git Diff:';
+export const CONTEXT_HEADING = 'Additional Context:';
+
+/** The xAI API key from an environment, or undefined when it is unset or blank. */
+export function xaiApiKey(env: Record<string, string | undefined>): string | undefined {
+  return env.XAI_API_KEY?.trim() || undefined;
+}
+
+export const INSTALL_HINTS: Record<string, string> = {
+  antigravity: 'curl -fsSL https://antigravity.google/cli/install.sh | bash',
+  codex: 'npm install -g @openai/codex',
+  gemini: 'npm install -g @google/gemini-cli',
+  ollama: 'https://ollama.com/download',
+  xai: 'Set XAI_API_KEY (https://console.x.ai)',
+  claude: 'npm install -g @anthropic-ai/claude-code',
+  opencode: 'npm install -g opencode-ai',
+  pi: 'npm install -g @earendil-works/pi-coding-agent',
+  grok: 'npm install -g @xai-official/grok',
+};
+
+export const BACKEND_COMMANDS: Record<string, string> = {
+  antigravity: 'agy',
+  claude: 'claude',
+  codex: 'codex',
+  gemini: 'gemini',
+  ollama: 'ollama',
+  opencode: 'opencode',
+  pi: 'pi',
+  grok: 'grok',
+};
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+const registry = new Map<string, Backend>();
+
+export function registerBackend(backend: Backend): void {
+  registry.set(backend.name, backend);
+}
+
+export function getBackend(name: string): Backend {
+  const backend = registry.get(name);
+  if (!backend) {
+    const supported = [...registry.keys()].sort().join(', ');
+    throw new BackendError(
+      `Unsupported relay backend: ${name}. Supported: ${supported}`,
+    );
+  }
+  return backend;
+}
+
+/** Clear registry — only for testing. */
+export function _resetRegistry(): void {
+  registry.clear();
+}
+
+// ---------------------------------------------------------------------------
+// PATH detection
+// ---------------------------------------------------------------------------
+
+export function isInPath(name: string, env?: Record<string, string>): boolean {
+  try {
+    execFileSync('which', [name], { stdio: 'pipe', ...(env ? { env } : {}) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function checkBackends(
+  whichFn: (name: string) => boolean = isInPath,
+): Record<string, boolean> {
+  const result: Record<string, boolean> = {};
+  for (const name of Object.keys(INSTALL_HINTS).sort()) {
+    result[name] = name === 'xai' ? xaiApiKey(process.env) !== undefined : whichFn(BACKEND_COMMANDS[name] ?? name);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Async subprocess runner
+// ---------------------------------------------------------------------------
+
+/**
+ * Prompts of this many bytes or more are written to the backend's stdin
+ * instead of being passed as an argument, for the backends whose CLI reads a
+ * prompt there (Claude and Codex, both checked against the real CLIs).
+ *
+ * Linux refuses any single argument of 131,072 bytes or more with
+ * `spawn E2BIG` (reproduced on Node 22 in a Linux container; macOS allows
+ * about 1 MB for all arguments and the environment together), and PaF accepts
+ * prompts up to 500,000 bytes. A review with an inlined diff or a relay with a
+ * context file passes that size easily. Smaller prompts stay arguments, so an
+ * ordinary relay's command line is unchanged.
+ */
+export const STDIN_PROMPT_MIN_BYTES = 100_000;
+
+/** The prompt when it has to travel on stdin, otherwise undefined. */
+export function largePromptStdin(prompt: string): string | undefined {
+  return Buffer.byteLength(prompt) >= STDIN_PROMPT_MIN_BYTES ? prompt : undefined;
+}
+
+/** Message for a backend process that could not be started. */
+export function spawnFailureMessage(label: string, error: Error): string {
+  if ((error as NodeJS.ErrnoException).code === 'E2BIG') {
+    return `${label} failed to start: its command line is larger than the operating system allows (E2BIG). ` +
+      'Linux limits one argument to 131,071 bytes, and antigravity, gemini, opencode and pi take the prompt ' +
+      'as an argument. Send a shorter prompt, context or diff, or use --to claude, --to codex or --to grok, ' +
+      'which do not.';
+  }
+  return `${label} failed to start: ${error.message}`;
+}
+
+/**
+ * Run a `spawn()` call and report a failure to start as a BackendError.
+ * Node throws E2BIG from `spawn()` itself instead of emitting `error` (seen on
+ * Node 22, Linux), so without this the user got a bare "spawn E2BIG".
+ */
+export function startChild<T>(label: string, start: () => T): T {
+  try {
+    return start();
+  } catch (err: unknown) {
+    throw new BackendError(spawnFailureMessage(label, err instanceof Error ? err : new Error(String(err))));
+  }
+}
+
+export interface SpawnCliOptions {
+  /** Time limit in milliseconds. `0` means no limit. */
+  timeoutMs: number;
+  /** Written to the child's stdin, which is then closed. Without it stdin is not opened. */
+  stdin?: string;
+  /** Full process environment. Defaults to process.env if not provided.
+   *  When provided, this replaces the entire env (Node.js spawn behavior).
+   *  Callers must pass a complete env (e.g. from nextRelayEnv()), not partial overrides. */
+  env?: Record<string, string>;
+  cwd?: string;
+  /** Label used in error messages (e.g. "codex exec", "gemini"). Defaults to the command name. */
+  label?: string;
+  /** Receives stdout chunks as they arrive, for progress observers. Errors thrown here are ignored. */
+  onStdout?: (chunk: string) => void;
+  /** Time between SIGTERM and SIGKILL. Defaults to `KILL_GRACE_MS`. */
+  killGraceMs?: number;
+}
+
+export interface SpawnCliResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+}
+
+/**
+ * Write `input` to a child's stdin and close it. A child that exits without
+ * reading (a rejected flag, a missing sign-in) breaks the pipe; its exit status
+ * is the error to report, so the write error is dropped.
+ */
+export function writeChildStdin(child: { stdin?: NodeJS.WritableStream | null }, input: string | undefined): void {
+  if (input === undefined || !child.stdin) return;
+  child.stdin.on('error', () => {});
+  child.stdin.end(input);
+}
+
+/**
+ * Async subprocess runner shared by all CLI backends.
+ * Replaces execFileSync: non-blocking, stderr draining. `superviseChild()` owns
+ * the time limit, signal forwarding and termination.
+ */
+export function spawnCli(
+  command: string,
+  args: string[],
+  opts: SpawnCliOptions,
+): Promise<SpawnCliResult> {
+  const label = opts.label ?? command;
+
+  return new Promise((resolve, reject) => {
+    // A throw here rejects the promise with the explained error.
+    const child = startChild(label, () => nodeSpawn(command, args, {
+      stdio: [opts.stdin === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      env: opts.env ?? process.env as Record<string, string>,
+      cwd: opts.cwd,
+      ...ownProcessGroup(),
+    }));
+    writeChildStdin(child, opts.stdin);
+    const supervisor = superviseChild(child, { timeoutMs: opts.timeoutMs, killGraceMs: opts.killGraceMs });
+
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdoutChunks.push(chunk);
+      if (opts.onStdout) {
+        try {
+          opts.onStdout(chunk.toString());
+        } catch {
+          // Observers must never break the subprocess run.
+        }
+      }
+    });
+    child.stderr?.on('data', (chunk: Buffer) => stderrChunks.push(chunk));
+
+    void supervisor.exit.then(({ code, signal, spawnError }) => {
+      if (spawnError) {
+        reject(new BackendError(spawnFailureMessage(label, spawnError)));
+        return;
+      }
+
+      const stdout = Buffer.concat(stdoutChunks).toString().trim();
+      const stderr = Buffer.concat(stderrChunks).toString().trim();
+
+      if (supervisor.timedOut) {
+        reject(new SpawnCliTimeoutError(`${label} timed out after ${opts.timeoutMs / 1000}s`, opts.timeoutMs));
+        return;
+      }
+
+      // Before the exit status: a backend can stop early and still exit 0.
+      if (supervisor.interruptedBy) {
+        reject(new BackendError(`${label} interrupted by ${supervisor.interruptedBy}`));
+        return;
+      }
+
+      if (signal) {
+        reject(new BackendError(`${label} killed by signal ${signal}`));
+        return;
+      }
+
+      if (code !== 0 && code !== null) {
+        const detail = stderr || stdout || `${label} exited with code ${code}`;
+        reject(new SpawnCliError(detail, stdout, stderr, code));
+        return;
+      }
+
+      resolve({ stdout, stderr, exitCode: code ?? 0 });
+    });
+  });
+}
